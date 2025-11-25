@@ -1,12 +1,13 @@
 """
 De-identification Module
 Removes PHI (Protected Health Information) from text
+Uses Hugging Face models directly
 """
 import re
 from typing import Optional
 from transformers import AutoTokenizer, AutoModelForTokenClassification, pipeline
 
-from ..config import PHI_REPLACE_TAGS
+from ..config import PHI_REPLACE_TAGS, HUGGINGFACE_MODELS, MODEL_PATHS
 
 
 class Deidentifier:
@@ -28,16 +29,24 @@ class Deidentifier:
             self._load_ner_model()
     
     def _load_ner_model(self):
-        """Load NER model for entity recognition"""
+        """Load NER model from Hugging Face"""
         try:
-            tokenizer = AutoTokenizer.from_pretrained("dslim/bert-base-NER")
-            model = AutoModelForTokenClassification.from_pretrained("dslim/bert-base-NER")
+            print(f"Loading NER model: {HUGGINGFACE_MODELS['NER_MODEL']}")
+            tokenizer = AutoTokenizer.from_pretrained(
+                HUGGINGFACE_MODELS['NER_MODEL'],
+                cache_dir=MODEL_PATHS.get('CACHE_DIR')
+            )
+            model = AutoModelForTokenClassification.from_pretrained(
+                HUGGINGFACE_MODELS['NER_MODEL'],
+                cache_dir=MODEL_PATHS.get('CACHE_DIR')
+            )
             self.ner_pipeline = pipeline(
                 "ner", 
                 model=model, 
                 tokenizer=tokenizer, 
                 aggregation_strategy="simple"
             )
+            print("NER model loaded successfully!")
         except Exception as e:
             print(f"Warning: Could not load NER model: {e}. Using fallback method.")
             self.ner_pipeline = None

@@ -14,6 +14,10 @@ class DocumentExporter:
 
     def export_to_json(self, data: Dict, filepath: Path) -> str:
         """Export to JSON"""
+        # Ensure parent directory exists
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
         return str(filepath)
@@ -24,6 +28,10 @@ class DocumentExporter:
         filepath: Path
     ) -> str:
         """Export prescription to LaTeX format"""
+        
+        # Ensure parent directory exists
+        filepath = Path(filepath)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
 
         # Escape LaTeX special characters
         def escape_latex(text):

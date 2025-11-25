@@ -16,6 +16,7 @@ OUTPUT_DIR = DATA_DIR / "outputs"
 
 # Ensure directories exist
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 # Audio Recording Settings
 AUDIO_CONFIG = {
@@ -28,26 +29,37 @@ AUDIO_CONFIG = {
     'MIN_SEGMENT_SAMPLES': 1600
 }
 
-# Model Paths
+# Hugging Face Model Names (instead of local paths)
+HUGGINGFACE_MODELS = {
+    # Whisper ASR Model
+    'ASR_MODEL': os.getenv('ASR_MODEL', 'openai/whisper-base'),
+    
+    # PyAnnote Models
+    'EMBEDDING_MODEL': os.getenv('EMBEDDING_MODEL', 'pyannote/embedding'),
+    'DIARIZATION_MODEL': os.getenv('DIARIZATION_MODEL', 'pyannote/speaker-diarization-3.1'),
+    
+    # NER Model for De-identification
+    'NER_MODEL': os.getenv('NER_MODEL', 'dslim/bert-base-NER'),
+}
+
+# Model Paths (for cached embeddings and local storage)
 MODEL_PATHS = {
-    'EMBEDDING_PATH': os.getenv('EMBEDDING_PATH', str(MODEL_DIR / 'doctor_embedding.npy')),
-    'ASR_MODEL_PATH': os.getenv('ASR_MODEL_PATH', str(MODEL_DIR / 'whisper-base-local')),
-    'EMBEDDING_MODEL_PATH': os.getenv('EMBEDDING_MODEL_PATH', str(MODEL_DIR / 'pyannote-embedding-local/pytorch_model.bin')),
-    'EMBEDDING_CONFIG_PATH': os.getenv('EMBEDDING_CONFIG_PATH', str(MODEL_DIR / 'pyannote-embedding-local/config.yaml')),
-    'DIARIZATION_PIPELINE_PATH': os.getenv('DIARIZATION_PIPELINE_PATH', str(MODEL_DIR / 'pyannote-diarization-local'))
+    'DOCTOR_EMBEDDING_PATH': os.getenv('DOCTOR_EMBEDDING_PATH', str(MODEL_DIR / 'doctor_embedding.npy')),
+    'CACHE_DIR': str(MODEL_DIR / 'huggingface_cache')
 }
 
 # Processing Settings
 PROCESSING_CONFIG = {
     'SIMILARITY_THRESHOLD': float(os.getenv('SIMILARITY_THRESHOLD', '0.60')),
     'MIN_SEGMENT_DURATION': 0.5,
-    'DEVICE': 0  # Use GPU if available, else -1 for CPU
+    'DEVICE': 0,  # Use GPU if available, else -1 for CPU
+    'USE_AUTH_TOKEN': os.getenv('HUGGINGFACE_TOKEN', None)  # Optional HF token for gated models
 }
 
 # API Configuration
 API_CONFIG = {
     'GOOGLE_API_KEY': os.getenv('GOOGLE_API_KEY'),
-    'GEMINI_MODEL': 'gemini-1.5-flash',
+    'GEMINI_MODEL': 'gemini-2.5-flash',
     'TEMPERATURE': 0.3
 }
 
