@@ -30,9 +30,18 @@ import pyaudio
 import wave
 import threading
 import queue
+import smtplib
+import asyncio
+from email.mime.text import MIMEText
 
 # Load environment variables
 load_dotenv()
+
+# MailHog SMTP Configuration (can be overridden via environment variables)
+SMTP_HOST = os.getenv('SMTP_HOST', 'localhost')
+SMTP_PORT = int(os.getenv('SMTP_PORT', '1025'))
+SENDER_EMAIL = os.getenv('SENDER_EMAIL', 'admin@yourcompany.com')
+FALLBACK_RECIPIENT = os.getenv('FALLBACK_RECIPIENT', 'clinic@yourcompany.com')
 
 # Page configuration
 st.set_page_config(
@@ -410,6 +419,261 @@ def detect_emergency(conversation_text: str) -> Dict[str, Any]:
     if matches:
         return {"level": "EMERGENCY", "matches": matches}
     return {"level": "NORMAL", "matches": []}
+
+
+def _send_single_email(row, idx, total, sender_email, smtp_host, smtp_port):
+    """Helper function to send a single email (synchronous)"""
+    try:
+        # Get recipient email
+        recipient = row.get('email', '')
+        # pandas may represent missing values as NaN (a float) so check for that explicitly
+        if pd.isna(recipient) or str(recipient).strip() == '':
+            return {
+                'idx': idx,
+                'email_sent': False,
+                'sent_at': '',
+                'send_status': 'No email address'
+            }
+        # Create email - ensure we cast values to strings to avoid unexpected types
+        body = row.get('email_body', '')
+        subject = row.get('email_subject', '')
+        msg = MIMEText(str(body), 'plain')
+        msg['Subject'] = str(subject)
+        msg['From'] = str(sender_email)
+        msg['To'] = str(recipient)
+        
+        # Connect and send (fresh connection for each email)
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.sendmail(str(sender_email), [str(recipient)], msg.as_string())
+        
+        # Update status
+        return {
+            'idx': idx,
+            'email_sent': True,
+            'sent_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'send_status': 'Success',
+            'recipient': recipient,
+            'name': row.get('name', '')
+        }
+        
+    except Exception as e:
+        return {
+            'idx': idx,
+            'email_sent': False,
+            'sent_at': '',
+            'send_status': f'Error: {str(e)}',
+            'name': row.get('name', '')
+        }
+
+
+async def send_emails_async(input_csv='output/emails_generated.csv', output_csv='output/emails_sent_status.csv'):
+    """Read CSV and send emails via MailHog - async version"""
+    
+    print(f"\n📂 Loading emails from {input_csv}...")
+    
+    # Load CSV
+    df = pd.read_csv(input_csv)
+    
+    print(f"✅ Loaded {len(df)} emails to send\n")
+    
+    # Add status columns
+    df['email_sent'] = False
+    df['email_sender'] = SENDER_EMAIL
+    df['sent_at'] = ''
+    df['send_status'] = ''
+    
+    # Send emails in parallel (reconnect for each email to avoid connection drops)
+    print(f"🔗 Using MailHog at {SMTP_HOST}:{SMTP_PORT}\n")
+    print(f"📤 Sending {len(df)} emails in parallel...\n")
+    
+    # Create tasks for parallel sending with real-time output
+    async def send_with_index(idx, row):
+        result = await asyncio.to_thread(
+            _send_single_email,
+            row,
+            idx,
+            len(df),
+            SENDER_EMAIL,
+            SMTP_HOST,
+            SMTP_PORT
+        )
+        return idx, row.get('name', 'Unknown'), result
+    
+    tasks = []
+    for idx, row in df.iterrows():
+        tasks.append(send_with_index(idx, row))
+    
+    # Process results as they complete
+    completed_count = 0
+    results_dict = {}
+    
+    for coro in asyncio.as_completed(tasks):
+        try:
+            idx, name, result = await coro
+            completed_count += 1
+            
+            # Print output immediately
+            if result['email_sent']:
+                print(f"✅ [{completed_count}/{len(df)}] Sent to {result.get('name', name)} ({result.get('recipient', '')})")
+            else:
+                print(f"❌ [{completed_count}/{len(df)}] Failed for {result.get('name', name)} - {result['send_status']}")
+            
+            # Store result with original index
+            results_dict[idx] = result
+            
+        except Exception as e:
+            completed_count += 1
+            print(f"❌ [{completed_count}/{len(df)}] Error sending email: {e}")
+            # We can't recover idx/name from exception, skip this entry
+    
+    # Update dataframe with results
+    for idx, result in results_dict.items():
+        df.at[idx, 'email_sent'] = result['email_sent']
+        df.at[idx, 'sent_at'] = result['sent_at']
+        df.at[idx, 'send_status'] = result['send_status']
+    
+    # Save status CSV
+    df.to_csv(output_csv, index=False)
+    
+    # Summary
+    sent_count = df['email_sent'].sum()
+    print(f"\n{'='*60}")
+    print(f"📊 SUMMARY")
+    print(f"{'='*60}")
+    print(f"✅ Successfully sent: {sent_count}/{len(df)} emails")
+    print(f"❌ Failed: {len(df) - sent_count}")
+    print(f"💾 Status saved to: {output_csv}")
+    print(f"{'='*60}\n")
+    
+    return df
+
+
+def send_emails(input_csv='output/emails_generated.csv', output_csv='output/emails_sent_status.csv'):
+    """Read CSV and send emails via MailHog - sync wrapper for backward compatibility"""
+    return asyncio.run(send_emails_async(input_csv, output_csv))
+
+
+def generate_patient_email(conversation_text: str, patient_info: dict, emergency_alert: dict) -> Dict[str, str]:
+    """Generate a simple email (subject and body) using Gemini LLM when available; fall back to a template.
+    First Tell about like Argent or Moderate Argent
+    Returns a dict with 'subject' and 'body'.
+    """
+    # Short prompt to create an email for the patient or emergency contact depending on emergency flag
+    is_emergency = emergency_alert and emergency_alert.get('level') == 'EMERGENCY'
+
+    prompt_template = (
+        "You are a concise clinical assistant.\n"
+        "Given the following de-identified patient conversation and patient info, produce a short email subject and a plain-text body.\n"
+        "If this is an emergency, clearly state that immediate action is required and advise to call local emergency services.\n"
+        "Keep the email short (subject <= 8 words, body <= 6 sentences).\n\n"
+        "Conversation:\n{conversation}\n\nPatient Info:\nName: {name}\nAge: {age}\nGender: {gender}\n\nEmergency: {emergency}\n\nRespond in JSON with keys: subject, body."
+    )
+
+    prompt = prompt_template.format(
+        conversation=(conversation_text[:3000] if conversation_text else 'No conversation available'),
+        name=patient_info.get('Patient_Name', patient_info.get('name', 'Patient')),
+        age=patient_info.get('Age', 'Unknown'),
+        gender=patient_info.get('Gender', 'Unknown'),
+        emergency=is_emergency
+    )
+
+    try:
+        # Use the existing model instance if possible
+        llm_prompt = ChatPromptTemplate.from_template(prompt)
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.2)
+        chain = llm_prompt | llm | StrOutputParser()
+        out = chain.invoke({})
+        # Attempt to parse JSON from the output
+        import json as _json
+        try:
+            parsed = _json.loads(out)
+            subject = parsed.get('subject', '').strip()
+            body = parsed.get('body', '').strip()
+            if subject and body:
+                return {'subject': subject, 'body': body}
+        except Exception:
+            # If the model did not return JSON, fall back to text parsing
+            text = out.strip()
+            # First line as subject, rest as body
+            lines = [l for l in text.splitlines() if l.strip()]
+            subject = lines[0] if lines else ('EMERGENCY: Immediate attention needed' if is_emergency else 'Follow-up from your consultation')
+            body = '\n'.join(lines[1:]) if len(lines) > 1 else text
+            return {'subject': subject, 'body': body}
+    except Exception as e:
+        # On error, fallback to template
+        pass
+
+    # Fallback templates
+    if is_emergency:
+        return {
+            'subject': 'EMERGENCY: Immediate medical attention required',
+            'body': (
+                f"Dear {patient_info.get('Patient_Name', 'Patient')},\n\n"
+                "Our system detected potentially life-threatening symptoms in your recent consultation. Please call local emergency services or go to the nearest emergency department immediately.\n\n"
+                "If this was an error, contact your provider right away.\n\n"
+                "— Clinical Support Team"
+            )
+        }
+    else:
+        return {
+            'subject': 'Follow-up from your recent consultation',
+            'body': (
+                f"Dear {patient_info.get('Patient_Name', 'Patient')},\n\n"
+                "Thank you for your recent consultation. We reviewed your conversation and have prepared a summary and recommendations. Please review your patient portal for details or contact us if you have questions.\n\n"
+                "— Clinical Support Team"
+            )
+        }
+
+
+def generate_and_send_email(conversation_text: str, patient_info: dict, emergency_alert: dict) -> Dict[str, Any]:
+    """Generate a patient email and send it via MailHog (writes a CSV and triggers send).
+
+    Returns a dict: {'ok': bool, 'used_fallback': bool, 'recipient': str}
+    """
+    try:
+        os.makedirs('output', exist_ok=True)
+        email_content = generate_patient_email(conversation_text, patient_info, emergency_alert)
+
+        recipient = patient_info.get('email') or patient_info.get('Patient_Email') or st.session_state.patient_info.get('email', '')
+        name = patient_info.get('Patient_Name') or patient_info.get('name') or st.session_state.patient_info.get('Patient_Name', '')
+
+        used_fallback = False
+        if pd.isna(recipient) or str(recipient).strip() == '':
+            # No patient email; use fallback recipient (clinic inbox / MailHog) so messages still arrive for review
+            recipient = FALLBACK_RECIPIENT
+            used_fallback = True
+
+        row = {
+            'name': name,
+            'email': recipient,
+            'email_subject': email_content.get('subject', ''),
+            'email_body': email_content.get('body', '')
+        }
+
+        df = pd.DataFrame([row])
+        input_csv = 'output/emails_generated.csv'
+        output_csv = 'output/emails_sent_status.csv'
+        df.to_csv(input_csv, index=False)
+
+        # Run send in background thread so Streamlit UI is not blocked for long
+        def _run_send():
+            try:
+                send_emails(input_csv=input_csv, output_csv=output_csv)
+            except Exception as e:
+                # Log to a file if sending fails
+                with open('output/email_errors.log', 'a') as f:
+                    f.write(f"{datetime.now().isoformat()} - Email send failed: {str(e)}\n")
+
+        threading.Thread(target=_run_send, daemon=True).start()
+        return {'ok': True, 'used_fallback': used_fallback, 'recipient': recipient}
+    except Exception as e:
+        # Non-fatal - return failure dict so caller can proceed
+        try:
+            with open('output/email_errors.log', 'a') as f:
+                f.write(f"{datetime.now().isoformat()} - generate_and_send_email failed: {str(e)}\n")
+        except Exception:
+            pass
+        return {'ok': False, 'used_fallback': False, 'recipient': ''}
 
 def generate_soap_note(conversation_text, patient_info):
     """Generate SOAP note from de-identified conversation"""
@@ -1268,6 +1532,20 @@ def render_upload_stage():
                                 with open("/home/shahanahmed/Office_Shellow_EMR/result.json", "w") as json_file:
                                     json.dump(patient_info, json_file, indent=4)
                                 
+                                # Generate and send a short email notification (MailHog)
+                                try:
+                                    conv_text = conversation_text_for_alert
+                                    res = generate_and_send_email(conv_text, st.session_state.patient_info, st.session_state.emergency_alert)
+                                    if res.get('ok'):
+                                        if res.get('used_fallback'):
+                                            st.warning(f"⚠️ Patient email missing — message sent to fallback inbox ({res.get('recipient')}). Check MailHog.")
+                                        else:
+                                            st.info("📧 Email generation queued (check MailHog)")
+                                    else:
+                                        st.warning("⚠️ Email generation failed. See output/email_errors.log for details.")
+                                except Exception as e:
+                                    st.warning(f"Email generation failed: {e}")
+                                
                                 # Move to next stage
                                 st.session_state.current_stage = 'conversation'
                                 
@@ -1339,6 +1617,19 @@ def render_upload_stage():
                             # Save patient info to file
                             with open("/home/shahanahmed/Office_Shellow_EMR/result.json", "w") as json_file:
                                 json.dump(patient_info, json_file, indent=4)
+                            # Generate and send a short email notification (MailHog)
+                            try:
+                                conv_text = conversation_text_for_alert
+                                res = generate_and_send_email(conv_text, st.session_state.patient_info, st.session_state.emergency_alert)
+                                if res.get('ok'):
+                                    if res.get('used_fallback'):
+                                        st.warning(f"⚠️ Patient email missing — message sent to fallback inbox ({res.get('recipient')}). Check MailHog.")
+                                    else:
+                                        st.info("📧 Email generation queued (check MailHog)")
+                                else:
+                                    st.warning("⚠️ Email generation failed. See output/email_errors.log for details.")
+                            except Exception as e:
+                                st.warning(f"Email generation failed: {e}")
                             
                             # Move to next stage without generating suggestions
                             st.session_state.current_stage = 'conversation'
