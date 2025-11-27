@@ -12,100 +12,107 @@ st.set_page_config(page_title="Audio Recorder with Embedding", page_icon="🎙�
 # App title and instructions
 st.title("Audio Recorder with Speaker Embedding")
 st.markdown("""
-Record audio using your microphone. The audio will be saved as a WAV file, and a speaker embedding will be generated and saved as a `.npy` file. Use the download buttons to retrieve the files.
+Record audio or upload an audio file.  
+The audio will be saved as a WAV file, and a speaker embedding will be generated and saved as a `.npy` file.
 """)
 
-# Initialize pyannote.audio embedding model
+# Initialize embedding model
 @st.cache_resource
 def load_embedding_model():
     try:
         return Inference("pyannote/embedding", window="whole")
     except Exception as e:
-        st.error(f"Failed to load embedding model: {e}. Please check your Hugging Face token and internet connection.")
+        st.error(f"Failed to load embedding model: {e}")
         st.stop()
 
 inference = load_embedding_model()
 
-# Function to generate embedding from audio bytes
-def get_embedding(audio_bytes):
-    temp_wav = "temp_audio.wav"
+# Generate embedding function
+def get_embedding_from_bytes(audio_bytes):
+    temp_wav = "temp.wav"
     try:
-        # Read audio bytes and save as temporary WAV
-        with io.BytesIO(audio_bytes) as audio_buffer:
-            audio_data, sample_rate = sf.read(audio_buffer)
-            sf.write(temp_wav, audio_data, sample_rate, format="WAV")
-        
-        # Load waveform and generate embedding
-        waveform, sample_rate = torchaudio.load(temp_wav)
-        embedding = inference({'waveform': waveform, 'sample_rate': sample_rate})
-        return embedding
+        with io.BytesIO(audio_bytes) as buffer:
+            audio_data, sr = sf.read(buffer)
+            sf.write(temp_wav, audio_data, sr)
+
+        waveform, sr = torchaudio.load(temp_wav)
+        emb = inference({'waveform': waveform, 'sample_rate': sr})
+        return emb
     except Exception as e:
-        st.error(f"Error generating embedding: {e}")
+        st.error(f"Embedding error: {e}")
         return None
     finally:
-        # Clean up temporary file
         if os.path.exists(temp_wav):
             os.remove(temp_wav)
 
-# Audio input widget
-audio = st.audio_input("Record audio (click to start/stop)", disabled=False)
 
-if audio:
-    # Display the recorded audio
-    st.audio(audio, format="audio/wav")
-    
-    # Save audio as WAV
-    output_audio_file = "recorded_audio.wav"
+# -------------------------
+# 1. RECORD AUDIO SECTION
+# -------------------------
+st.subheader("🎤 Record Audio")
+
+recorded = st.audio_input("Click to start recording")
+
+if recorded:
+    st.audio(recorded, format="audio/wav")
+
+    # Save audio
+    wav_file = "recorded_audio.wav"
+    with io.BytesIO(recorded.getbuffer()) as buffer:
+        audio_data, sr = sf.read(buffer)
+        sf.write(wav_file, audio_data, sr)
+
+    st.success("Recorded audio saved.")
+
+    # Generate embedding
+    with st.spinner("Generating embedding..."):
+        emb = get_embedding_from_bytes(recorded.getbuffer())
+
+    if emb is not None:
+        npy_file = "recorded_embedding.npy"
+        np.save(npy_file, emb)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("Download WAV", open(wav_file, "rb"), wav_file)
+        with col2:
+            st.download_button("Download Embedding (.npy)", open(npy_file, "rb"), npy_file)
+
+
+# -------------------------
+# 2. UPLOAD AUDIO SECTION
+# -------------------------
+st.subheader("📁 Upload Audio File")
+
+uploaded = st.file_uploader("Upload a WAV, MP3, M4A file", type=["wav", "mp3", "m4a"])
+
+if uploaded:
+    st.audio(uploaded, format="audio/wav")
+
+    # Save uploaded audio to WAV
+    wav_file = "uploaded_audio.wav"
     try:
-        with io.BytesIO(audio.getbuffer()) as audio_buffer:
-            audio_data, sample_rate = sf.read(audio_buffer)
-            sf.write(output_audio_file, audio_data, sample_rate, format="WAV")
-        st.success(f"Audio saved as '{output_audio_file}'")
+        with io.BytesIO(uploaded.read()) as buffer:
+            audio_data, sr = sf.read(buffer)
+            sf.write(wav_file, audio_data, sr)
+
+        st.success("Uploaded audio saved as WAV.")
     except Exception as e:
-        st.error(f"Error saving audio: {e}")
+        st.error(f"Invalid audio format: {e}")
         st.stop()
-    
-    # Generate and save embedding
-    with st.spinner("Generating speaker embedding..."):
-        embedding = get_embedding(audio.getbuffer())
-    
-    if embedding is not None:
-        output_embedding_file = "recorded_embedding.npy"
-        try:
-            np.save(output_embedding_file, embedding)
-            st.success(f"Embedding saved as '{output_embedding_file}'")
-            
-            # Provide download buttons
-            col1, col2 = st.columns(2)
-            with col1:
-                with open(output_audio_file, "rb") as f:
-                    st.download_button(
-                        label="Download WAV file",
-                        data=f,
-                        file_name=output_audio_file,
-                        mime="audio/wav",
-                        key="download_wav"
-                    )
-            with col2:
-                with open(output_embedding_file, "rb") as f:
-                    st.download_button(
-                        label="Download embedding (.npy)",
-                        data=f,
-                        file_name=output_embedding_file,
-                        mime="application/octet-stream",
-                        key="download_npy"
-                    )
-        except Exception as e:
-            st.error(f"Error saving embedding: {e}")
-    else:
-        st.warning("Embedding generation failed. You can still download the audio.")
-        
-        # Provide download button for audio only
-        with open(output_audio_file, "rb") as f:
-            st.download_button(
-                label="Download WAV file",
-                data=f,
-                file_name=output_audio_file,
-                mime="audio/wav",
-                key="download_wav_fallback"
-            )
+
+    # Generate embedding
+    with st.spinner("Generating embedding..."):
+        with open(wav_file, "rb") as f:
+            emb = get_embedding_from_bytes(f.read())
+
+    if emb is not None:
+        npy_file = "uploaded_embedding.npy"
+        np.save(npy_file, emb)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button("Download WAV", open(wav_file, "rb"), wav_file)
+        with col2:
+            st.download_button("Download Embedding (.npy)", open(npy_file, "rb"), npy_file)
+

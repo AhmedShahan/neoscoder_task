@@ -237,6 +237,9 @@ def initialize_session_state():
         st.session_state.custom_suggestions = []
     if 'selected_suggestions' not in st.session_state:
         st.session_state.selected_suggestions = []
+    # Emergency alert: set to dict like {"level": "EMERGENCY"/"NORMAL", "matches": [keywords]}
+    if 'emergency_alert' not in st.session_state:
+        st.session_state.emergency_alert = None
 
 # Helper function to get unique ID for medicines
 def get_medicine_unique_id(medicine_name):
@@ -350,6 +353,64 @@ def format_conversation_for_soap(transcription):
     """Format transcription for SOAP note generation"""
     return "\n".join([f"{item['speaker']}: {item['text']}" for item in transcription])
 
+
+def detect_emergency(conversation_text: str) -> Dict[str, Any]:
+    """Simple rule-based emergency detector.
+
+    Returns a dict: {"level": "EMERGENCY"|'NORMAL', "matches": [matched_terms]}
+    """
+    if not conversation_text:
+        return {"level": "NORMAL", "matches": []}
+
+    text = conversation_text.lower()
+
+    # Emergency keyword groups (not exhaustive). If any of these are found, flag emergency.
+    emergency_phrases = [
+        r"chest pain",
+        r"severe chest",
+        r"shortness of breath",
+        r"difficulty breathing",
+        r"trouble breathing",
+        r"not breathing",
+        r"no pulse",
+        r"cardiac arrest",
+        r"unconscious",
+        r"loss of consciousness",
+        r"fainting",
+        r"severe bleeding",
+        r"bleeding heavily",
+        r"severe burn",
+        r"severe burn",
+        r"stroke",
+        r"i am having a stroke",
+        r"slurred speech",
+        r"weakness on",
+        r"numbness",
+        r"sudden vision",
+        r"anaphylaxis",
+        r"anaphylactic",
+        r"severe allergic",
+        r"seizure",
+        r"convulsions",
+        r"suicidal",
+        r"kill myself",
+        r"overdose",
+        r"poisoning",
+        r"collapsed",
+        r"not responding",
+        r"no response",
+    ]
+
+    import re
+    matches = []
+    for phrase in emergency_phrases:
+        if re.search(phrase, text):
+            matches.append(phrase)
+
+    if matches:
+        return {"level": "EMERGENCY", "matches": matches}
+    return {"level": "NORMAL", "matches": []}
+
 def generate_soap_note(conversation_text, patient_info):
     """Generate SOAP note from de-identified conversation"""
     # De-identify the conversation
@@ -391,7 +452,7 @@ PLAN:
     
     # Initialize Gemini model
     llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
+        model="gemini-2.5-flash",
         temperature=0.3
     )
     
@@ -536,7 +597,7 @@ def get_drug_interactions(drug_list: List[str]) -> dict:
         return {"interactions": [], "error": f"Failed to get drug interactions: {str(e)}"}
 
 # Model and prompts
-model = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0.3)
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
 
 diagnosis_prompt = ChatPromptTemplate.from_messages([
     ("system", "You are a Medical Diagnostic Suggestion Engine."),
@@ -623,6 +684,7 @@ medicine_parser = PydanticOutputParser(pydantic_object=MedicineSuggestions)
 drug_alert_parser = PydanticOutputParser(pydantic_object=DrugAlertAnalysis)
 
 # Audio processing
+
 def process_audio(audio_path):
     EMBEDDING_PATH = "/home/shahanahmed/Office_Shellow_EMR/doctor_embedding.npy"
     ASR_MODEL_PATH = "/home/shahanahmed/Office_Shellow_EMR/model/whisper-base-local"
@@ -632,13 +694,20 @@ def process_audio(audio_path):
     SIMILARITY_THRESHOLD = 0.60
     DEVICE = 0 if torch.cuda.is_available() else -1
     TARGET_SAMPLE_RATE = 16000
-    MIN_SEGMENT_SAMPLES = 1600  # Minimum samples required for processing
+    MIN_SEGMENT_SAMPLES = 1600
 
-    # Convert MP3 to WAV if necessary
+    # Convert MP3 to WAV if necessary and ensure proper format
     temp_audio_path = audio_path
-    if audio_path.endswith('.mp3'):
-        temp_audio_path = audio_path.replace('.mp3', '.wav')
-        audio = AudioSegment.from_mp3(audio_path)
+    if audio_path.endswith('.mp3') or audio_path.endswith('.m4a'):
+        temp_audio_path = audio_path.rsplit('.', 1)[0] + '_converted.wav'
+        audio = AudioSegment.from_file(audio_path)
+        # Ensure mono, 16kHz
+        audio = audio.set_channels(1).set_frame_rate(TARGET_SAMPLE_RATE)
+        audio.export(temp_audio_path, format="wav")
+    elif not audio_path.endswith('.wav'):
+        temp_audio_path = audio_path.rsplit('.', 1)[0] + '_converted.wav'
+        audio = AudioSegment.from_file(audio_path)
+        audio = audio.set_channels(1).set_frame_rate(TARGET_SAMPLE_RATE)
         audio.export(temp_audio_path, format="wav")
 
     try:
@@ -646,49 +715,106 @@ def process_audio(audio_path):
         asr = pipeline("automatic-speech-recognition", model=ASR_MODEL_PATH, device=DEVICE)
         embedding_model = Model.from_pretrained(EMBEDDING_MODEL_PATH, config_yaml=EMBEDDING_CONFIG_PATH)
         embedder = Inference(embedding_model, window="whole")
-        diarization_pipeline = SpeakerDiarization.from_pretrained(DIARIZATION_PIPELINE_PATH + '/config.yaml')
-
-        # Load and preprocess audio
+        
+        # Load audio first to check duration
         waveform, sr = torchaudio.load(temp_audio_path)
-        if waveform.shape[0] > 1:  # Convert to mono if stereo
+        if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
         if sr != TARGET_SAMPLE_RATE:
             resampler = torchaudio.transforms.Resample(sr, TARGET_SAMPLE_RATE)
             waveform = resampler(waveform)
             sr = TARGET_SAMPLE_RATE
 
-        # Perform diarization
-        diarization = diarization_pipeline(temp_audio_path)
+        # Get total duration
+        total_samples = waveform.shape[1]
+        total_duration = total_samples / sr
+        
+        # Pad audio to multiple of 5 seconds to avoid diarization issues
+        # Pyannote often expects audio in specific chunk sizes
+        chunk_duration = 5.0  # 5 seconds
+        chunk_samples = int(chunk_duration * sr)
+        
+        if total_samples % chunk_samples != 0:
+            padding_needed = chunk_samples - (total_samples % chunk_samples)
+            waveform = torch.nn.functional.pad(waveform, (0, padding_needed), mode='constant', value=0)
+            
+            # Save the padded audio for diarization
+            padded_audio_path = temp_audio_path.rsplit('.', 1)[0] + '_padded.wav'
+            torchaudio.save(padded_audio_path, waveform, sr)
+            diarization_input = padded_audio_path
+        else:
+            diarization_input = temp_audio_path
+
+        # Perform diarization on padded audio
+        try:
+            diarization_pipeline = SpeakerDiarization.from_pretrained(
+                DIARIZATION_PIPELINE_PATH + '/config.yaml'
+            )
+            diarization = diarization_pipeline(diarization_input)
+        except Exception as diar_error:
+            st.warning(f"Diarization failed: {str(diar_error)}. Treating entire audio as single speaker.")
+            # Fallback: treat entire audio as single speaker
+            results = []
+            audio_np = waveform.squeeze().numpy()
+            if audio_np.dtype != np.float32:
+                audio_np = audio_np.astype(np.float32)
+            
+            transcription = asr(audio_np, return_timestamps=True)["text"]
+            
+            results.append({
+                "speaker": "Doctor",  # Default to doctor
+                "text": transcription,
+                "timestamp": f"0.00-{total_duration:.2f}s"
+            })
+            
+            # Clean up
+            if diarization_input != temp_audio_path and os.path.exists(diarization_input):
+                os.unlink(diarization_input)
+            if temp_audio_path != audio_path and os.path.exists(temp_audio_path):
+                os.unlink(temp_audio_path)
+            
+            return results
+
         results = []
 
         for turn, _, speaker in diarization.itertracks(yield_label=True):
             segment: Segment = turn
-            if segment.duration < 0.5:  # Skip very short segments
+            if segment.duration < 0.5:
+                continue
+
+            # Clamp segment times to original audio duration
+            start_time = min(max(segment.start, 0), total_duration)
+            end_time = min(segment.end, total_duration)
+            
+            if start_time >= end_time:
                 continue
 
             # Calculate sample indices
-            start_sample = int(segment.start * sr)
-            end_sample = int(segment.end * sr)
-            if end_sample > waveform.shape[1]:
-                end_sample = waveform.shape[1]  # Prevent out-of-bounds
+            start_sample = int(start_time * sr)
+            end_sample = int(end_time * sr)
+            
+            # Ensure indices are within original audio bounds
+            start_sample = max(0, min(start_sample, total_samples))
+            end_sample = max(start_sample, min(end_sample, total_samples))
+            
             if start_sample >= end_sample:
                 continue
 
-            # Extract segment waveform
-            segment_length = end_sample - start_sample
+            # Extract segment from ORIGINAL waveform (before padding)
+            segment_waveform = waveform[:, start_sample:end_sample]
+            segment_length = segment_waveform.shape[1]
+            
             if segment_length < MIN_SEGMENT_SAMPLES:
-                # Pad short segments with zeros to reach minimum length
                 padding = MIN_SEGMENT_SAMPLES - segment_length
                 speaker_waveform = torch.nn.functional.pad(
-                    waveform[:, start_sample:end_sample], 
+                    segment_waveform, 
                     (0, padding), 
                     mode='constant', 
                     value=0
                 )
             else:
-                speaker_waveform = waveform[:, start_sample:end_sample]
+                speaker_waveform = segment_waveform
 
-            # Ensure waveform is 2D (1 channel)
             if speaker_waveform.dim() == 1:
                 speaker_waveform = speaker_waveform.unsqueeze(0)
 
@@ -696,7 +822,14 @@ def process_audio(audio_path):
             audio_np = speaker_waveform.squeeze().numpy()
             if audio_np.dtype != np.float32:
                 audio_np = audio_np.astype(np.float32)
-            transcription = asr(audio_np, return_timestamps=True)["text"]
+            
+            try:
+                transcription = asr(audio_np, return_timestamps=True)["text"]
+                if not transcription or not transcription.strip():
+                    continue
+            except Exception as e:
+                st.warning(f"Failed to transcribe segment at {start_time:.2f}s: {str(e)}")
+                continue
 
             # Generate embedding
             try:
@@ -709,7 +842,13 @@ def process_audio(audio_path):
                         segment_embedding = embedder(tmp_file.name)
                         os.unlink(tmp_file.name)
                 except Exception as e2:
-                    st.warning(f"Failed to generate embedding for segment: {str(e2)}")
+                    st.warning(f"Failed to generate embedding: {str(e2)}")
+                    # Use default speaker if embedding fails
+                    results.append({
+                        "speaker": "Patient",
+                        "text": transcription,
+                        "timestamp": f"{start_time:.2f}-{end_time:.2f}s"
+                    })
                     continue
 
             # Determine speaker
@@ -719,10 +858,12 @@ def process_audio(audio_path):
             results.append({
                 "speaker": label,
                 "text": transcription,
-                "timestamp": f"{segment.start:.2f}-{segment.end:.2f}s"
+                "timestamp": f"{start_time:.2f}-{end_time:.2f}s"
             })
 
-        # Clean up temporary WAV file if created
+        # Clean up temporary files
+        if diarization_input != temp_audio_path and os.path.exists(diarization_input):
+            os.unlink(diarization_input)
         if temp_audio_path != audio_path and os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)
 
@@ -730,10 +871,17 @@ def process_audio(audio_path):
 
     except Exception as e:
         st.error(f"Error processing audio: {str(e)}")
-        # Clean up temporary WAV file in case of error
+        import traceback
+        st.error(traceback.format_exc())
+        
+        # Clean up temporary files
         if temp_audio_path != audio_path and os.path.exists(temp_audio_path):
             os.unlink(temp_audio_path)
+        
         return []
+    
+
+
 # Structured data extraction
 def extract_structured_data(transcription):
     patient_parser = PydanticOutputParser(pydantic_object=PatientInformation)
@@ -1048,6 +1196,21 @@ def render_upload_stage():
         <p>Record audio or upload an audio file for processing.</p>
     </div>
     """, unsafe_allow_html=True)
+    # Show emergency alert (if any) detected from transcription
+    try:
+        if st.session_state.get('emergency_alert') and st.session_state.emergency_alert.get('level') == 'EMERGENCY':
+            matches = st.session_state.emergency_alert.get('matches', [])
+            matches_text = ', '.join(matches) if matches else 'keywords matched'
+            st.markdown(f"""
+            <div class="conversation-item alert-high">
+                <h3>⚠️ EMERGENCY DETECTED</h3>
+                <p><strong>Detected phrases:</strong> {matches_text}</p>
+                <p><strong>Recommendation:</strong> This conversation contains possible life-threatening symptoms. Seek immediate medical attention or call local emergency services.</p>
+            </div>
+            """, unsafe_allow_html=True)
+    except Exception:
+        # Don't break the UI for unexpected session state shapes
+        pass
     
     col1, col2 = st.columns(2)
     
@@ -1092,6 +1255,10 @@ def render_upload_stage():
                                 
                                 # Store transcription
                                 st.session_state.transcription = transcription
+
+                                # Run emergency detection on the transcribed text
+                                conversation_text_for_alert = "\n".join([item.get('text', '') for item in transcription])
+                                st.session_state.emergency_alert = detect_emergency(conversation_text_for_alert)
                                 
                                 # Extract patient information
                                 patient_info = extract_structured_data(transcription)
@@ -1160,6 +1327,10 @@ def render_upload_stage():
                             
                             # Store transcription
                             st.session_state.transcription = transcription
+
+                            # Run emergency detection on the transcribed text
+                            conversation_text_for_alert = "\n".join([item.get('text', '') for item in transcription])
+                            st.session_state.emergency_alert = detect_emergency(conversation_text_for_alert)
                             
                             # Extract patient information
                             patient_info = extract_structured_data(transcription)
