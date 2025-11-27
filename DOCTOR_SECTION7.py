@@ -1361,7 +1361,30 @@ def render_conversation_stage():
         <p>Review the processed conversation between doctor and patient.</p>
     </div>
     """, unsafe_allow_html=True)
-    
+    # Emergency/Non-emergency alert banner at top of conversation page
+    try:
+        alert = st.session_state.get('emergency_alert')
+        if alert and alert.get('level') == 'EMERGENCY':
+            matches = alert.get('matches', [])
+            matches_text = ', '.join(matches) if matches else 'keywords matched'
+            st.markdown(f"""
+            <div class="conversation-item alert-high">
+                <h3>⚠️ EMERGENCY DETECTED</h3>
+                <p><strong>Detected phrases:</strong> {matches_text}</p>
+                <p><strong>Recommendation:</strong> This conversation contains possible life-threatening symptoms. Seek immediate medical attention or call local emergency services.</p>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Show a non-emergency banner so the top always indicates status
+            st.markdown(f"""
+            <div class="conversation-item alert-low">
+                <h4>✅ No emergency detected</h4>
+                <p>The transcribed conversation does not contain high-priority emergency keywords.</p>
+            </div>
+            """, unsafe_allow_html=True)
+    except Exception:
+        # Don't break the UI on unexpected session state
+        pass
     # Display conversation
     for item in st.session_state.transcription:
         speaker_class = "doctor-message" if item['speaker'] == 'Doctor' else "patient-message"
